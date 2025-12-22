@@ -6,7 +6,14 @@ import LoginModal from './LoginModal';
 import AddEventModal from './AddEventModal';
 import SettingsModal from './SettingsModal';
 import ProfileCard from './ProfileCard';
-import Footer from './Footer'; // NEW IMPORT
+import Footer from './Footer';
+
+// --- CONFIGURATION ---
+// 👇 THIS IS THE KEY CHANGE
+// If we are on your computer, use localhost. If on the web, use your Vercel Backend.
+const API_BASE = window.location.hostname === "localhost" 
+  ? "http://localhost:5000" 
+  : "https://algo-cal.vercel.app"; 
 
 // --- ASSETS ---
 const logos = {
@@ -40,7 +47,8 @@ function App() {
 
     if (token && savedEmail) {
       setUser(savedEmail);
-      axios.get('http://localhost:5000/api/user', { headers: { 'x-auth-token': token } })
+      // 👇 Updated to use API_BASE
+      axios.get(`${API_BASE}/api/user`, { headers: { 'x-auth-token': token } })
         .then(res => {
           if (res.data.filters) setFilters(res.data.filters);
           if (res.data.alarms) setAlarms(res.data.alarms.map(a => a.contestId));
@@ -50,7 +58,8 @@ function App() {
         .catch(err => console.error("Session error", err));
     }
 
-    axios.get('http://localhost:5000/api/contests')
+    // 👇 Updated to use API_BASE
+    axios.get(`${API_BASE}/api/contests`)
       .then((response) => setEvents(response.data))
       .catch((error) => console.error("Error:", error));
   }, []);
@@ -103,7 +112,8 @@ function App() {
     const token = localStorage.getItem('token');
     const isAlarmSet = alarms.includes(contestId);
     setAlarms(isAlarmSet ? alarms.filter(id => id !== contestId) : [...alarms, contestId]);
-    axios.post('http://localhost:5000/api/alarms', { contestId, title, start }, { headers: { 'x-auth-token': token } });
+    // 👇 Updated to use API_BASE
+    axios.post(`${API_BASE}/api/alarms`, { contestId, title, start }, { headers: { 'x-auth-token': token } });
   };
 
   const handleFilterChange = (platform) => {
@@ -111,7 +121,8 @@ function App() {
     setFilters(newFilters);
     const token = localStorage.getItem('token');
     if (user && token) {
-      axios.post('http://localhost:5000/api/filters', { filters: newFilters }, { headers: { 'x-auth-token': token } });
+      // 👇 Updated to use API_BASE
+      axios.post(`${API_BASE}/api/filters`, { filters: newFilters }, { headers: { 'x-auth-token': token } });
     }
   };
 
@@ -127,13 +138,15 @@ function App() {
     };
     setPersonalEvents([...personalEvents, newEvent]);
     const token = localStorage.getItem('token');
-    axios.post('http://localhost:5000/api/personal-events', newEvent, { headers: { 'x-auth-token': token } });
+    // 👇 Updated to use API_BASE
+    axios.post(`${API_BASE}/api/personal-events`, newEvent, { headers: { 'x-auth-token': token } });
   };
 
   const handleSaveHandles = (newHandles) => {
     setHandles(newHandles);
     const token = localStorage.getItem('token');
-    axios.post('http://localhost:5000/api/handles', { handles: newHandles }, { headers: { 'x-auth-token': token } });
+    // 👇 Updated to use API_BASE
+    axios.post(`${API_BASE}/api/handles`, { handles: newHandles }, { headers: { 'x-auth-token': token } });
   };
 
   const handleEventClick = (info) => {
@@ -144,7 +157,8 @@ function App() {
       if (confirmDelete) {
         setPersonalEvents(personalEvents.filter(e => e.id !== info.event.id));
         const token = localStorage.getItem('token');
-        axios.delete(`http://localhost:5000/api/personal-events/${info.event.id}`, { headers: { 'x-auth-token': token } });
+        // 👇 Updated to use API_BASE
+        axios.delete(`${API_BASE}/api/personal-events/${info.event.id}`, { headers: { 'x-auth-token': token } });
       }
     }
   };
