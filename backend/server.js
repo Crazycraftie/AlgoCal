@@ -12,10 +12,14 @@ app.use(express.json());
 
 const PORT = process.env.PORT || 5000;
 
-// 1. DB CONNECTION
-mongoose.connect(process.env.MONGO_URI)
-    .then(() => console.log("✅ MongoDB Connected"))
-    .catch(err => console.error("❌ DB Error:", err));
+// 1. DB CONNECTION (FIXED FOR VERCEL)
+mongoose.connect(process.env.MONGO_URI, {
+    serverSelectionTimeoutMS: 5000, 
+    socketTimeoutMS: 45000, 
+    family: 4
+})
+.then(() => console.log("✅ MongoDB Connected"))
+.catch(err => console.error("❌ DB Error:", err));
 
 // 2. USER MODEL
 const UserSchema = new mongoose.Schema({
