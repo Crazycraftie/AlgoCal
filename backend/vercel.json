@@ -1,12 +1,6 @@
 {
-  "rewrites": [
-    { "source": "/(.*)", "destination": "/server.js" }
-  ],
   "functions": {
     "server.js": {
-      "maxDuration": 60
-    },
-    "**/*.js": {
       "maxDuration": 60
     }
   }
