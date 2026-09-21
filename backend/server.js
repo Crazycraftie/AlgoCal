@@ -5,12 +5,25 @@ const cors = require('cors');
 const mongoose = require('mongoose');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
+const webpush = require('web-push');
+const cron = require('node-cron');
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
 const PORT = process.env.PORT || 5000;
+
+// WEB PUSH SETUP (real push notifications, delivered even when the tab is closed)
+if (process.env.VAPID_PUBLIC_KEY && process.env.VAPID_PRIVATE_KEY) {
+    webpush.setVapidDetails(
+        process.env.VAPID_SUBJECT || 'mailto:admin@example.com',
+        process.env.VAPID_PUBLIC_KEY,
+        process.env.VAPID_PRIVATE_KEY
+    );
+} else {
+    console.warn("⚠️ VAPID keys not set — push notifications are disabled");
+}
 
 // 1. DB CONNECTION (FIXED FOR VERCEL)
 mongoose.connect(process.env.MONGO_URI, {
@@ -33,7 +46,7 @@ const UserSchema = new mongoose.Schema({
         codechef: { type: Boolean, default: true },
         other: { type: Boolean, default: true }
     },
-    alarms: [{ contestId: String, title: String, start: Date }],
+    alarms: [{ contestId: String, title: String, start: Date, notified: { type: Boolean, default: false } }],
     personalEvents: [{ id: String, title: String, start: Date, allDay: Boolean }],
     handles: {
         codeforces: { type: String, default: "" },
@@ -41,7 +54,11 @@ const UserSchema = new mongoose.Schema({
         atcoder: { type: String, default: "" },
         codechef: { type: String, default: "" },
         geeksforgeeks: { type: String, default: "" }
-    }
+    },
+    pushSubscriptions: [{
+        endpoint: String,
+        keys: { p256dh: String, auth: String }
+    }]
 });
 
 const User = mongoose.model('User', UserSchema);
@@ -109,10 +126,10 @@ app.post('/api/alarms', auth, async (req, res) => {
         const user = await User.findById(req.user.id);
         const { contestId, title, start } = req.body;
         const baseId = String(contestId).split('_')[0];
-        const existsIndex = user.alarms.findIndex(a => String(a.contestId).startsWith(baseId));
+        const existsIndex = user.alarms.findIndex(a => String(a.contestId).split('_')[0] === baseId);
 
-        if (existsIndex > -1) { user.alarms.splice(existsIndex, 1); } 
-        else { user.alarms.push({ contestId: baseId, title, start }); }
+        if (existsIndex > -1) { user.alarms.splice(existsIndex, 1); }
+        else { user.alarms.push({ contestId, title, start }); }
         
         await user.save();
         res.json(user.alarms);
@@ -154,33 +171,242 @@ app.get('/api/user', auth, async (req, res) => {
     } catch (err) { res.status(500).send('Server Error'); }
 });
 
-// NEW: ROBUST GFG PROXY ROUTE (Switched to a more stable API)
+// WEB PUSH ROUTES
+app.get('/api/vapid-public-key', (req, res) => {
+    res.json({ publicKey: process.env.VAPID_PUBLIC_KEY || null });
+});
+
+app.post('/api/push-subscribe', auth, async (req, res) => {
+    try {
+        const sub = req.body;
+        if (!sub || !sub.endpoint || !sub.keys) return res.status(400).json({ error: 'Invalid subscription' });
+
+        const user = await User.findById(req.user.id);
+        const alreadySubscribed = user.pushSubscriptions.some(s => s.endpoint === sub.endpoint);
+        if (!alreadySubscribed) {
+            user.pushSubscriptions.push({ endpoint: sub.endpoint, keys: sub.keys });
+            await user.save();
+        }
+        res.json({ ok: true });
+    } catch (err) { res.status(500).send('Server Error'); }
+});
+
+app.post('/api/push-unsubscribe', auth, async (req, res) => {
+    try {
+        const { endpoint } = req.body;
+        const user = await User.findById(req.user.id);
+        user.pushSubscriptions = user.pushSubscriptions.filter(s => s.endpoint !== endpoint);
+        await user.save();
+        res.json({ ok: true });
+    } catch (err) { res.status(500).send('Server Error'); }
+});
+
+// Scans every user's alarms for contests starting in ~15 minutes and pushes a
+// notification to each of their subscribed devices. Runs on a local cron in dev;
+// in production it must be triggered externally (see CRON_SETUP.md) since Vercel
+// serverless functions can't run a persistent in-process scheduler.
+const checkAndSendAlarms = async () => {
+    if (!process.env.VAPID_PUBLIC_KEY || !process.env.VAPID_PRIVATE_KEY) return;
+
+    const now = Date.now();
+    const windowStart = new Date(now + 13 * 60 * 1000);
+    const windowEnd = new Date(now + 16 * 60 * 1000);
+
+    try {
+        const users = await User.find({
+            'alarms.0': { $exists: true },
+            'pushSubscriptions.0': { $exists: true }
+        });
+
+        for (const user of users) {
+            let changed = false;
+
+            for (const alarm of user.alarms) {
+                if (alarm.notified) continue;
+                const start = new Date(alarm.start);
+                if (start < windowStart || start > windowEnd) continue;
+
+                const payload = JSON.stringify({
+                    title: 'Contest Starting Soon!',
+                    body: `${alarm.title} starts in 15 minutes!`,
+                    url: '/'
+                });
+
+                for (const sub of [...user.pushSubscriptions]) {
+                    try {
+                        await webpush.sendNotification(sub, payload);
+                    } catch (err) {
+                        // Subscription is dead (browser revoked it / user cleared data) — drop it.
+                        if (err.statusCode === 404 || err.statusCode === 410) {
+                            user.pushSubscriptions = user.pushSubscriptions.filter(s => s.endpoint !== sub.endpoint);
+                            changed = true;
+                        } else {
+                            console.error('❌ Push send error:', err.message);
+                        }
+                    }
+                }
+
+                alarm.notified = true;
+                changed = true;
+            }
+
+            if (changed) await user.save();
+        }
+    } catch (err) {
+        console.error('❌ Alarm check error:', err.message);
+    }
+};
+
+// Protected trigger for an external scheduler (Vercel Cron / cron-job.org) to call in production.
+app.get('/api/cron/check-alarms', async (req, res) => {
+    if (process.env.CRON_SECRET && req.header('x-cron-secret') !== process.env.CRON_SECRET) {
+        return res.status(401).json({ error: 'Unauthorized' });
+    }
+    await checkAndSendAlarms();
+    res.json({ ok: true });
+});
+
+// LEETCODE CONTEST RATING PROXY (leetcode.com/graphql has no CORS headers, and the
+// third-party stats API we use for solved-count doesn't expose contest rating)
+app.get('/api/leetcode-contest/:handle', async (req, res) => {
+    try {
+        const { handle } = req.params;
+        console.log(`🔍 Fetching LeetCode contest rating for: ${handle}`);
+
+        const response = await axios.post('https://leetcode.com/graphql', {
+            query: `query userContestRankingInfo($username: String!) {
+                userContestRanking(username: $username) {
+                    rating
+                    globalRanking
+                    attendedContestsCount
+                }
+            }`,
+            variables: { username: handle }
+        }, { headers: { 'Content-Type': 'application/json' } });
+
+        const ranking = response.data?.data?.userContestRanking;
+        if (!ranking) {
+            // Either an invalid handle, or a valid one that's never entered a contest.
+            return res.status(404).json({ error: "No contest rating found" });
+        }
+
+        console.log("✅ LeetCode Contest Success:", ranking.rating);
+        res.json({
+            rating: Math.round(ranking.rating) || 0,
+            globalRanking: ranking.globalRanking || 0,
+            attended: ranking.attendedContestsCount || 0
+        });
+    } catch (error) {
+        console.error("❌ LeetCode Contest API Error:", error.response ? error.response.status : error.message);
+        res.status(500).json({ error: "Failed to fetch LeetCode contest rating" });
+    }
+});
+
+// GFG PROXY ROUTE (gfg-stats.vercel.app was decommissioned; using GFG's own public profile-info API)
 app.get('/api/gfg/:handle', async (req, res) => {
     try {
         const { handle } = req.params;
-        console.log(`🔍 Fetching GFG stats for: ${handle}`); 
-        
-        // Using a more stable community API
-        const response = await axios.get(`https://gfg-stats.vercel.app/api?username=${handle}`);
-        
-        // The new API returns data inside an 'info' object
-        if (!response.data || !response.data.info) {
+        console.log(`🔍 Fetching GFG stats for: ${handle}`);
+
+        const response = await axios.get(`https://authapi.geeksforgeeks.org/api-get/user-profile-info/?handle=${handle}`, {
+            headers: { 'User-Agent': 'Mozilla/5.0' }
+        });
+
+        if (!response.data || !response.data.data) {
             console.log("❌ GFG User Not Found or API Error");
             return res.status(404).json({ error: "User not found" });
         }
 
-        const stats = response.data.info;
-        
-        console.log("✅ GFG Success:", stats.totalProblemsSolved); 
+        const stats = response.data.data;
+
+        console.log("✅ GFG Success:", stats.total_problems_solved);
         res.json({
             // Ensure we handle cases where data might be a string or number
-            solved: parseInt(stats.totalProblemsSolved) || 0,
-            score: parseInt(stats.codingScore) || 0
+            solved: parseInt(stats.total_problems_solved) || 0,
+            score: parseInt(stats.score) || 0
         });
     } catch (error) {
         // Log the specific error to help debugging
         console.error("❌ GFG API Error:", error.response ? error.response.status : error.message);
+        // authapi.geeksforgeeks.org returns 400 for an unknown handle
+        if (error.response && error.response.status === 400) {
+            return res.status(404).json({ error: "User not found" });
+        }
         res.status(500).json({ error: "Failed to fetch GFG stats" });
+    }
+});
+
+// ATCODER PROXY ROUTE (atcoder.jp has no CORS headers, so browsers can't call it directly)
+app.get('/api/atcoder/:handle', async (req, res) => {
+    try {
+        const { handle } = req.params;
+        console.log(`🔍 Fetching AtCoder stats for: ${handle}`);
+
+        // AtCoder's JSON history endpoint only exposes per-contest placement, not the
+        // user's overall global rank, so we scrape the "Rank" field off the profile page.
+        const response = await axios.get(`https://atcoder.jp/users/${handle}`, {
+            headers: { 'User-Agent': 'Mozilla/5.0' }
+        });
+        const html = response.data;
+
+        const ratingMatch = html.match(/<th class="no-break">Rating<\/th><td>.*?user-[a-z]+'>(\d+)</s);
+        if (!ratingMatch) {
+            return res.status(404).json({ error: "User not found" });
+        }
+        const rankMatch = html.match(/Rank<\/th><td>([\d,]+)/);
+
+        const rating = parseInt(ratingMatch[1]) || 0;
+        const rank = rankMatch ? parseInt(rankMatch[1].replace(/,/g, '')) : 0;
+
+        // AtCoder Problems (community-run, third-party) tracks accepted-problem counts,
+        // which AtCoder's own site/API doesn't expose directly.
+        let solved = 0;
+        try {
+            const acRankRes = await axios.get(`https://kenkoooo.com/atcoder/atcoder-api/v3/user/ac_rank?user=${handle}`);
+            solved = acRankRes.data?.count || 0;
+        } catch (e) { /* non-fatal: leave solved at 0 */ }
+
+        console.log("✅ AtCoder Success:", rating);
+        res.json({ rating, rank, solved });
+    } catch (error) {
+        console.error("❌ AtCoder API Error:", error.response ? error.response.status : error.message);
+        if (error.response && error.response.status === 404) {
+            return res.status(404).json({ error: "User not found" });
+        }
+        res.status(500).json({ error: "Failed to fetch AtCoder stats" });
+    }
+});
+
+// CODECHEF PROXY ROUTE (codechef-stats.tashif.codes has no CORS headers)
+app.get('/api/codechef/:handle', async (req, res) => {
+    try {
+        const { handle } = req.params;
+        console.log(`🔍 Fetching CodeChef stats for: ${handle}`);
+
+        const response = await axios.get(`https://codechef-stats.tashif.codes/${handle}`);
+
+        if (!response.data || response.data.status !== 'success') {
+            return res.status(404).json({ error: "User not found" });
+        }
+
+        const stats = response.data.data;
+
+        // This API returns HTTP 200 "success" even for a handle that doesn't exist,
+        // just with every field blank/zero — treat that shape as "not found" too.
+        if (stats.currentRating === null && stats.totalSolved === 0 && stats.totalActiveDays === 0) {
+            return res.status(404).json({ error: "User not found" });
+        }
+
+        console.log("✅ CodeChef Success:", stats.currentRating);
+        res.json({
+            rating: parseInt(stats.currentRating) || 0,
+            maxRating: parseInt(stats.maxRating) || 0,
+            solved: parseInt(stats.totalSolved) || 0,
+            stars: stats.rank || 'N/A'
+        });
+    } catch (error) {
+        console.error("❌ CodeChef API Error:", error.response ? error.response.status : error.message);
+        res.status(500).json({ error: "Failed to fetch CodeChef stats" });
     }
 });
 
@@ -225,6 +451,11 @@ app.get('/api/contests', async (req, res) => {
     } catch (error) { res.status(500).json({ message: "Error fetching data" }); }
 });
 
-//app.listen(PORT, () => { console.log(`Server running on port ${PORT}`); });
+if (require.main === module) {
+    app.listen(PORT, () => { console.log(`Server running on port ${PORT}`); });
+    // Local/self-hosted dev convenience: on Vercel this won't run persistently,
+    // so production relies on /api/cron/check-alarms being hit externally.
+    cron.schedule('* * * * *', checkAndSendAlarms);
+}
 
 module.exports = app;

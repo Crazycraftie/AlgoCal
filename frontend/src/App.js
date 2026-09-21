@@ -24,6 +24,46 @@ const logos = {
   other: "https://cdn-icons-png.flaticon.com/512/921/921606.png"
 };
 
+// --- WEB PUSH HELPERS ---
+// Converts the VAPID public key (base64url) into the Uint8Array format the Push API expects.
+function urlBase64ToUint8Array(base64String) {
+  const padding = '='.repeat((4 - (base64String.length % 4)) % 4);
+  const base64 = (base64String + padding).replace(/-/g, '+').replace(/_/g, '/');
+  const rawData = window.atob(base64);
+  const outputArray = new Uint8Array(rawData.length);
+  for (let i = 0; i < rawData.length; i++) outputArray[i] = rawData.charCodeAt(i);
+  return outputArray;
+}
+
+// Registers the service worker, requests notification permission, subscribes to
+// push, and hands the subscription to the backend so it can send real push
+// notifications (these work even when the tab/browser is closed, unlike the
+// in-tab `Notification` alarms below which only fire while the tab is open).
+async function subscribeToPush(token, apiBase) {
+  if (!('serviceWorker' in navigator) || !('PushManager' in window)) return;
+  try {
+    const reg = await navigator.serviceWorker.register('/sw.js');
+    const permission = await Notification.requestPermission();
+    if (permission !== 'granted') return;
+
+    let subscription = await reg.pushManager.getSubscription();
+    if (!subscription) {
+      const { data } = await axios.get(`${apiBase}/api/vapid-public-key`);
+      if (!data.publicKey) return; // push disabled on the backend (no VAPID keys configured)
+      subscription = await reg.pushManager.subscribe({
+        userVisibleOnly: true,
+        applicationServerKey: urlBase64ToUint8Array(data.publicKey)
+      });
+    }
+
+    await axios.post(`${apiBase}/api/push-subscribe`, subscription.toJSON(), {
+      headers: { 'x-auth-token': token }
+    });
+  } catch (err) {
+    console.error("Push subscription failed", err);
+  }
+}
+
 function App() {
   const [events, setEvents] = useState([]); 
   const [personalEvents, setPersonalEvents] = useState([]); 
@@ -53,9 +93,11 @@ function App() {
           if (res.data.filters) setFilters(res.data.filters);
           if (res.data.alarms) setAlarms(res.data.alarms.map(a => a.contestId));
           if (res.data.personalEvents) setPersonalEvents(res.data.personalEvents);
-          if (res.data.handles) setHandles(res.data.handles); 
+          if (res.data.handles) setHandles(res.data.handles);
         })
         .catch(err => console.error("Session error", err));
+
+      subscribeToPush(token, API_BASE);
     }
 
     // 👇 Updated to use API_BASE
@@ -95,9 +137,24 @@ function App() {
     if (savedAlarms) setAlarms(savedAlarms.map(a => a.contestId));
     if (savedPersonalEvents) setPersonalEvents(savedPersonalEvents);
     if (savedHandles) setHandles(savedHandles);
+
+    const token = localStorage.getItem('token');
+    if (token) subscribeToPush(token, API_BASE);
   };
 
   const handleLogout = () => {
+    const token = localStorage.getItem('token');
+    // Detach this device's push subscription from the account so it stops
+    // receiving that user's contest alarms after logging out.
+    if (token && 'serviceWorker' in navigator) {
+      navigator.serviceWorker.getRegistration()
+        .then(reg => reg && reg.pushManager.getSubscription())
+        .then(sub => {
+          if (sub) axios.post(`${API_BASE}/api/push-unsubscribe`, { endpoint: sub.endpoint }, { headers: { 'x-auth-token': token } });
+        })
+        .catch(() => {});
+    }
+
     localStorage.removeItem('token');
     localStorage.removeItem('userEmail');
     setUser(null);
