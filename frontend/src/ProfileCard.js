@@ -19,6 +19,10 @@ function ProfileCard({ handles, onEdit }) {
   useEffect(() => {
     if (!handles) return;
     fetchStats();
+    // fetchStats is intentionally excluded: it's redefined every render and reads
+    // `stats` via closure, so depending on it would refetch on every render instead
+    // of only when the handles actually change.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [handles]);
 
   // Returns a user-facing message for a failed platform fetch, distinguishing

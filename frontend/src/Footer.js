@@ -20,10 +20,10 @@ function Footer() {
 
         {/* Center: Links */}
         <div className="flex gap-6 text-sm font-medium text-slate-400">
-          <a href="#" className="hover:text-blue-400 transition-colors">About</a>
-          <a href="#" className="hover:text-blue-400 transition-colors">Features</a>
-          <a href="#" className="hover:text-blue-400 transition-colors">Privacy</a>
-          <a href="#" className="hover:text-blue-400 transition-colors">Contact</a>
+          <button type="button" className="hover:text-blue-400 transition-colors">About</button>
+          <button type="button" className="hover:text-blue-400 transition-colors">Features</button>
+          <button type="button" className="hover:text-blue-400 transition-colors">Privacy</button>
+          <button type="button" className="hover:text-blue-400 transition-colors">Contact</button>
         </div>
 
         {/* Right Side: Socials / Made With */}
